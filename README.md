@@ -11,3 +11,9 @@ A Collection of useful little scripts for Reaper DAW that help accelerate my wor
     * Remove prefix from selected tracks
     * Remove prefix from all tracks
     * Select all tracks with prefix
+
+* Take Number display
+  * The idea is to display on screen which take is beinng recorded and make sure that the video camera sees that, in order to help match audio with video footage
+  * Opens a window that displays
+    * The current take number being recorded on the active tracks
+    * The list oarmed tracks being recorded
