@@ -52,7 +52,7 @@ local DARKEN_PER_STEP = 0.2
 local MIN_VALUE = 0.2
 
 -- Saturation (0 = gray, 1 = vivid rainbow). 0.4–0.7 = pastel-ish.
-local PASTEL_SATURATION = 0.6
+local PASTEL_SATURATION = 0.8
 
 -- Also apply color to all takes inside items?
 local APPLY_ITEM_TAKE_COLORS = true
