@@ -18,7 +18,7 @@
 --   "gradients/foo.png" -> relative to script folder
 --   absolute path       -> used as-is
 -- If loading fails, script silently falls back to rainbow.
-local GRADIENT_IMAGE_PATH = "Gradient Rainbow 2.png"
+local GRADIENT_IMAGE_PATH = "Gradient Rainbow 4.png"
 
 -- Sample row (0 = first row)
 local GRADIENT_SAMPLE_ROW = 0
