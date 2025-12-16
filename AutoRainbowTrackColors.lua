@@ -1,21 +1,34 @@
 --[[
-    ReaScript Name: Rainbow colors for top-level tracks with keywords,
-                   configurable hue distribution, pastel option,
-                   darker subtracks, and item coloring
+    ReaScript Name: Top-level colors from gradient (optional, silent fallback to rainbow) + keywords + darker subtracks + item coloring
     Author: ChatGPT
-    Description:
-        - Step 1: Keyword pass (for logic): determine which tracks match COLOR_RULES.
-        - Step 2: Assign rainbow hues to top-level tracks that DO NOT match a keyword.
-        - Step 3: Color all tracks/items using rainbow (with depth / previous darkening).
-        - Step 4: Apply keyword overrides:
-              * If a track name matches a keyword, that track AND its subtracks
-                get a specific RGB color from COLOR_RULES (overriding rainbow),
-                plus their items/takes.
+
+    Notes:
+        - Uses gfx.loadimg + gfx.blit + gfx.getpixel (no gfx.getimgpixel dependency).
+        - Avoids gfx.freeimg entirely (some builds don't expose it).
+        - Stereo pair detection: matches the previous track at the SAME DEPTH (ignoring children).
 ]]
 
 ------------------------------------------------------------
--- CONFIG: keyword color rules
--- Matching is case-insensitive, substring-based.
+-- CONFIG: gradient image
+------------------------------------------------------------
+
+-- Path to gradient image (thin horizontal strip).
+-- Can be:
+--   ""                  -> uses "gradient.png" next to script
+--   "gradients/foo.png" -> relative to script folder
+--   absolute path       -> used as-is
+-- If loading fails, script silently falls back to rainbow.
+local GRADIENT_IMAGE_PATH = "Gradient Rainbow 2.png"
+
+-- Sample row (0 = first row)
+local GRADIENT_SAMPLE_ROW = 0
+
+-- Optional "pastel blend": 0.0 = none, 1.0 = fully white
+local PASTEL_BLEND_TO_WHITE = 0.0
+
+
+------------------------------------------------------------
+-- CONFIG: keyword color rules (case-insensitive substring)
 ------------------------------------------------------------
 
 local COLOR_RULES =
@@ -23,104 +36,171 @@ local COLOR_RULES =
     { keyword = "NOTES", r = 255, g = 255, b = 204   },
     -- { keyword = "DRUM", r = 255, g = 180, b = 0   },
     -- { keyword = "BASS", r = 0,   g = 180, b = 255 },
-    -- { keyword = "GTR",  r = 0,   g = 200, b = 80  },
     -- { keyword = "VOC",  r = 220, g = 0,   b = 120 },
 }
 
+
 ------------------------------------------------------------
--- Other CONFIG
+-- CONFIG: distribution + darkening + item/take coloring
 ------------------------------------------------------------
 
--- Hue distribution across top-level tracks:
---   "adjacent"  -> neighbors close in hue (smooth rainbow)
---   "opposite"  -> neighbors far apart in hue (max separation)
--- local HUE_DISTRIBUTION = "opposite"
-local HUE_DISTRIBUTION = "adjacent"
+-- Distribution across top-level tracks that do NOT match a keyword:
+--   "adjacent"  -> sequential
+--   "opposite"  -> maximally separated order
+local DISTRIBUTION = "adjacent"  -- "adjacent" or "opposite"
 
 -- Darkening mode:
 --   "by_depth"      = brightness depends on track depth
 --   "from_previous" = each track is darker than the one above it
--- local DARKEN_MODE = "from_previous"
-local DARKEN_MODE = "by_depth"
+local DARKEN_MODE = "from_previous"   -- "by_depth" or "from_previous"
 
 -- How much to darken (0.0–1.0)
--- - In "by_depth": per depth level
--- - In "from_previous": per track step down within the same top-level block
-local DARKEN_PER_STEP = 0.2
+local DARKEN_PER_STEP = 0.15
 
--- Minimum brightness so things don't go fully black (0.0–1.0)
+-- Minimum brightness factor (0.0–1.0)
 local MIN_VALUE = 0.2
-
--- Saturation (0 = gray, 1 = vivid rainbow). 0.4–0.7 = pastel-ish.
-local PASTEL_SATURATION = 0.8
 
 -- Also apply color to all takes inside items?
 local APPLY_ITEM_TAKE_COLORS = true
 
 
 ------------------------------------------------------------
--- Helper: HSV → RGB
+-- CONFIG: stereo L/R pairing (no attenuation between a detected pair)
 ------------------------------------------------------------
-local function hsv_to_rgb(h, s, v)
-    -- h, s, v: 0.0–1.0
-    local i = math.floor(h * 6)
-    local f = h * 6 - i
-    local p = v * (1 - s)
-    local q = v * (1 - f * s)
-    local t = v * (1 - (1 - f) * s)
 
-    i = i % 6
+local ENABLE_STEREO_PAIR_NO_ATTENUATION = true
 
-    local r, g, b
+-- Array of suffix pairs. Matching is case-insensitive.
+-- Checked against track names AFTER trimming trailing spaces.
+-- Order can be L-R or R-L.
+local STEREO_SUFFIX_PAIRS =
+{
+    { " L", " R" },
+    { "L",  "R"  },  -- handy for names like "GtrL"/"GtrR"
+    { "_L", "_R" },
+    { "-L", "-R" },
+    { ".L", ".R" },
+    -- { " (L)", " (R)" },
+}
 
-    if i == 0 then
-        r, g, b = v, t, p
-    elseif i == 1 then
-        r, g, b = q, v, p
-    elseif i == 2 then
-        r, g, b = p, v, t
-    elseif i == 3 then
-        r, g, b = p, q, v
-    elseif i == 4 then
-        r, g, b = t, p, v
-    elseif i == 5 then
-        r, g, b = v, p, q
+
+------------------------------------------------------------
+-- Helpers: paths
+------------------------------------------------------------
+
+local function get_script_dir()
+    local src = debug.getinfo(1, "S").source or ""
+    if src:sub(1, 1) == "@" then
+        src = src:sub(2)
+    end
+    return src:match("^(.*[\\/])") or ""
+end
+
+local function is_absolute_path(p)
+    if not p or p == "" then return false end
+    if p:match("^%a:[\\/]") then return true end -- Windows drive
+    if p:sub(1, 1) == "/" then return true end     -- Unix/macOS
+    return false
+end
+
+local function resolve_gradient_path()
+    local base = get_script_dir()
+
+    if not GRADIENT_IMAGE_PATH or GRADIENT_IMAGE_PATH == "" then
+        return base .. "gradient.png"
     end
 
-    return math.floor(r * 255 + 0.5),
-           math.floor(g * 255 + 0.5),
-           math.floor(b * 255 + 0.5)
+    if is_absolute_path(GRADIENT_IMAGE_PATH) then
+        return GRADIENT_IMAGE_PATH
+    end
+
+    return base .. GRADIENT_IMAGE_PATH
 end
+
+
+------------------------------------------------------------
+-- Helper: clamp / blend / string helpers
+------------------------------------------------------------
+
+local function clamp01(x)
+    if x < 0.0 then return 0.0 end
+    if x > 1.0 then return 1.0 end
+    return x
+end
+
+local function blend_to_white(r, g, b, amount)
+    amount = clamp01(amount)
+    r = r + (255 - r) * amount
+    g = g + (255 - g) * amount
+    b = b + (255 - b) * amount
+    return math.floor(r + 0.5), math.floor(g + 0.5), math.floor(b + 0.5)
+end
+
+local function rstrip_spaces(s)
+    return (s or ""):gsub("%s+$", "")
+end
+
+local function ends_with(s, suffix)
+    if suffix == nil or suffix == "" then return false end
+    if s == nil then return false end
+    if #suffix > #s then return false end
+    return s:sub(-#suffix) == suffix
+end
+
+local function is_stereo_pair(prev_name, curr_name)
+    if not ENABLE_STEREO_PAIR_NO_ATTENUATION then
+        return false
+    end
+
+    local a = rstrip_spaces(prev_name):upper()
+    local b = rstrip_spaces(curr_name):upper()
+
+    for _, pair in ipairs(STEREO_SUFFIX_PAIRS) do
+        local s1 = (pair[1] or ""):upper()
+        local s2 = (pair[2] or ""):upper()
+
+        if s1 ~= "" and s2 ~= "" then
+            local a1 = ends_with(a, s1)
+            local a2 = ends_with(a, s2)
+            local b1 = ends_with(b, s1)
+            local b2 = ends_with(b, s2)
+
+            if (a1 and b2) or (a2 and b1) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
 
 ------------------------------------------------------------
 -- Helper: RGB → REAPER native color
 ------------------------------------------------------------
+
 local function rgb_to_native(r, g, b)
     return reaper.ColorToNative(r, g, b) | 0x1000000
 end
 
+
 ------------------------------------------------------------
 -- Helper: color a track AND all items (and optionally takes) on it
 ------------------------------------------------------------
+
 local function color_track_and_items(track, native_color)
-    -- Track
     reaper.SetTrackColor(track, native_color)
 
-    -- Items
     local item_count = reaper.CountTrackMediaItems(track)
-
     for i = 0, item_count - 1 do
         local item = reaper.GetTrackMediaItem(track, i)
-
         if item then
             reaper.SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", native_color)
 
             if APPLY_ITEM_TAKE_COLORS then
                 local take_count = reaper.CountTakes(item)
-
                 for t = 0, take_count - 1 do
                     local take = reaper.GetTake(item, t)
-
                     if take then
                         reaper.SetMediaItemTakeInfo_Value(take, "I_CUSTOMCOLOR", native_color)
                     end
@@ -130,11 +210,13 @@ local function color_track_and_items(track, native_color)
     end
 end
 
+
 ------------------------------------------------------------
--- Keyword matching helpers
+-- Keyword helpers
 ------------------------------------------------------------
+
 local function find_matching_rule(track_name)
-    local upper = track_name:upper()
+    local upper = (track_name or ""):upper()
 
     for _, rule in ipairs(COLOR_RULES) do
         local kw = (rule.keyword or ""):upper()
@@ -146,7 +228,6 @@ local function find_matching_rule(track_name)
     return nil
 end
 
--- Apply a keyword rule to a track and all its subtracks
 local function apply_keyword_rule_to_track_and_children(track_index, rule)
     local proj = 0
     local track_count = reaper.CountTracks(proj)
@@ -161,7 +242,6 @@ local function apply_keyword_rule_to_track_and_children(track_index, rule)
         local depth = reaper.GetTrackDepth(tr)
 
         if i > track_index and depth <= parent_depth then
-            -- we've exited this folder/block
             break
         end
 
@@ -169,9 +249,11 @@ local function apply_keyword_rule_to_track_and_children(track_index, rule)
     end
 end
 
+
 ------------------------------------------------------------
--- Helper: greatest common divisor (for "opposite" step selection)
+-- Distribution helpers
 ------------------------------------------------------------
+
 local function gcd(a, b)
     a = math.abs(a)
     b = math.abs(b)
@@ -183,64 +265,198 @@ local function gcd(a, b)
     return a
 end
 
-------------------------------------------------------------
--- Assign hues to NON-keyword top-level tracks based on distribution
-------------------------------------------------------------
-local function assign_top_level_hues(rainbow_top_indices)
-    local num_top = #rainbow_top_indices
-    local top_level_hues = {}  -- track index -> hue [0.0–1.0]
-
-    if num_top == 0 then
-        return top_level_hues
+-- Returns an integer slot in [0, n-1] for the given position (1..n)
+local function distribution_slot(pos, n)
+    if n <= 1 then
+        return 0
     end
 
-    if num_top == 1 then
-        local only_index = rainbow_top_indices[1]
-        top_level_hues[only_index] = 0.0
-        return top_level_hues
+    if DISTRIBUTION == "adjacent" then
+        return pos - 1
     end
 
-    if HUE_DISTRIBUTION == "adjacent" then
-        -- Simple left-to-right rainbow over remaining tracks
-        for pos, track_index in ipairs(rainbow_top_indices) do
-            local h = (pos - 1) / num_top     -- 0.0 .. <1.0
-            top_level_hues[track_index] = h
-        end
-    else
-        -- "opposite" (max-separated around the wheel) over remaining tracks
-        local step = math.floor(num_top / 2) + 1
+    -- "opposite": max separation order using a step ~ n/2 that is coprime with n
+    local step = math.floor(n / 2) + 1
 
-        -- Ensure gcd(step, num_top) == 1 so we visit all slots
-        while gcd(step, num_top) ~= 1 do
-            step = step + 1
-            if step >= num_top then
-                step = 1
-            end
-        end
-
-        for pos, track_index in ipairs(rainbow_top_indices) do
-            local slot = ((pos - 1) * step) % num_top
-            local h = slot / num_top         -- 0.0 .. <1.0
-            top_level_hues[track_index] = h
+    while gcd(step, n) ~= 1 do
+        step = step + 1
+        if step >= n then
+            step = 1
         end
     end
 
-    return top_level_hues
+    return ((pos - 1) * step) % n
 end
+
+
+------------------------------------------------------------
+-- Gradient sampling via gfx (no gfx.getimgpixel, no gfx.freeimg)
+------------------------------------------------------------
+
+local g_use_gradient = false
+local g_img_w = nil
+local g_img_h = nil
+local g_row_ready = false
+
+local function safe_gfx_quit()
+    if gfx and gfx.quit then
+        gfx.quit()
+    end
+end
+
+local function unload_gradient_image()
+    safe_gfx_quit()
+    g_row_ready = false
+    g_use_gradient = false
+    g_img_w = nil
+    g_img_h = nil
+end
+
+local function try_load_gradient_image(path)
+    if not gfx or not gfx.init or not gfx.loadimg or not gfx.getimgdim or not gfx.blit or not gfx.getpixel then
+        return false
+    end
+
+    -- First attempt: read dimensions
+    gfx.init("GradientSampler", 1, 1, 0, -10000, -10000)
+    if gfx.loadimg(0, path) == -1 then
+        safe_gfx_quit()
+        return false
+    end
+
+    local w, h = gfx.getimgdim(0)
+    safe_gfx_quit()
+
+    if not w or not h or w <= 0 or h <= 0 then
+        return false
+    end
+
+    -- Second attempt: create buffer of exact width so x maps 1:1 to pixels
+    gfx.init("GradientSampler", w, 1, 0, -10000, -10000)
+    if gfx.loadimg(0, path) == -1 then
+        safe_gfx_quit()
+        return false
+    end
+
+    g_use_gradient = true
+    g_img_w = w
+    g_img_h = h
+    g_row_ready = false
+    return true
+end
+
+local function ensure_gradient_row_blitted()
+    if not g_use_gradient or g_row_ready then
+        return
+    end
+
+    gfx.set(0, 0, 0, 1)
+    gfx.rect(0, 0, g_img_w, 1, 1)
+
+    local y = GRADIENT_SAMPLE_ROW
+    if y < 0 then y = 0 end
+    if y > (g_img_h - 1) then y = g_img_h - 1 end
+
+    gfx.blit(0, 1, 0,
+        0, y, g_img_w, 1,
+        0, 0, g_img_w, 1
+    )
+
+    g_row_ready = true
+end
+
+local function sample_gradient_rgb(t)
+    ensure_gradient_row_blitted()
+
+    t = clamp01(t)
+    local x = math.floor(t * (g_img_w - 1) + 0.5)
+
+    gfx.x = x
+    gfx.y = 0
+
+    local rr, gg, bb = gfx.getpixel()
+    local r = math.floor((rr or 0) * 255 + 0.5)
+    local g = math.floor((gg or 0) * 255 + 0.5)
+    local b = math.floor((bb or 0) * 255 + 0.5)
+
+    if PASTEL_BLEND_TO_WHITE > 0.0 then
+        r, g, b = blend_to_white(r, g, b, PASTEL_BLEND_TO_WHITE)
+    end
+
+    return r, g, b
+end
+
+
+------------------------------------------------------------
+-- Fallback: rainbow sampler (HSV)
+------------------------------------------------------------
+
+local function sample_rainbow_rgb(t)
+    t = clamp01(t)
+    if t >= 1.0 then
+        t = 0.999999
+    end
+
+    local h = t
+    local s = 1.0
+    local v = 1.0
+
+    local i = math.floor(h * 6)
+    local f = h * 6 - i
+    local p = v * (1 - s)
+    local q = v * (1 - f * s)
+    local tt = v * (1 - (1 - f) * s)
+
+    i = i % 6
+
+    local r, g, b
+    if i == 0 then
+        r, g, b = v, tt, p
+    elseif i == 1 then
+        r, g, b = q, v, p
+    elseif i == 2 then
+        r, g, b = p, v, tt
+    elseif i == 3 then
+        r, g, b = p, q, v
+    elseif i == 4 then
+        r, g, b = tt, p, v
+    elseif i == 5 then
+        r, g, b = v, p, q
+    end
+
+    local R = math.floor(r * 255 + 0.5)
+    local G = math.floor(g * 255 + 0.5)
+    local B = math.floor(b * 255 + 0.5)
+
+    if PASTEL_BLEND_TO_WHITE > 0.0 then
+        R, G, B = blend_to_white(R, G, B, PASTEL_BLEND_TO_WHITE)
+    end
+
+    return R, G, B
+end
+
 
 ------------------------------------------------------------
 -- Main
 ------------------------------------------------------------
+
 local function main()
     local proj = 0
     local track_count = reaper.CountTracks(proj)
-    if track_count == 0 then return end
+    if track_count == 0 then
+        return
+    end
 
-    --------------------------------------------------------
-    -- First: collect top-level tracks and detect keyword matches
-    --------------------------------------------------------
+    -- Try to load gradient image; silently fall back to rainbow
+    local gradient_path = resolve_gradient_path()
+    local ok = try_load_gradient_image(gradient_path)
+    if not ok then
+        g_use_gradient = false
+    end
+
+    -- Collect top-level tracks and detect keyword matches
     local top_level_indices = {}
-    local top_level_has_keyword = {}  -- [track_index] = true if this TL track matches a keyword
+    local top_level_has_keyword = {}
 
     for i = 0, track_count - 1 do
         local track = reaper.GetTrack(proj, i)
@@ -257,95 +473,141 @@ local function main()
         end
     end
 
-    if #top_level_indices == 0 then return end
+    if #top_level_indices == 0 then
+        if g_use_gradient then unload_gradient_image() end
+        return
+    end
 
-    --------------------------------------------------------
-    -- Build list of top-level tracks that should get rainbow
-    -- (i.e. NOT matching a keyword)
-    --------------------------------------------------------
-    local rainbow_top_indices = {}
-
+    -- Build list of top-level tracks that should get sampled colors (NOT matching keyword)
+    local sample_top_indices = {}
     for _, idx in ipairs(top_level_indices) do
         if not top_level_has_keyword[idx] then
-            table.insert(rainbow_top_indices, idx)
+            table.insert(sample_top_indices, idx)
         end
     end
 
-    --------------------------------------------------------
-    -- Assign hues only to rainbow_top_indices
-    --------------------------------------------------------
-    local top_level_hues = assign_top_level_hues(rainbow_top_indices)
+    -- Assign base RGB to remaining top-level tracks by sampling
+    local top_level_base_rgb = {}
+    local n = #sample_top_indices
+
+    for pos, track_index in ipairs(sample_top_indices) do
+        local slot = distribution_slot(pos, n)
+
+        local t
+        if n <= 1 then
+            t = 0
+        else
+            if g_use_gradient then
+                t = slot / (n - 1)  -- include endpoints for gradient pixels
+            else
+                t = slot / n        -- avoid t==1.0 wrap for HSV
+            end
+        end
+
+        local r, g, b
+        if g_use_gradient then
+            r, g, b = sample_gradient_rgb(t)
+        else
+            r, g, b = sample_rainbow_rgb(t)
+        end
+
+        top_level_base_rgb[track_index] = { r = r, g = g, b = b }
+    end
 
     --------------------------------------------------------
-    -- Rainbow / pastel pass: color all tracks & items
-    -- Only tracks whose top-level parent has an assigned hue are colored.
+    -- Pass 1: apply sampled colors + darkening + stereo pair lock
+    --
+    -- FIX: stereo pairing now compares against the previous track AT THE SAME DEPTH
+    -- within the same top-level block, ignoring any intervening child tracks.
     --------------------------------------------------------
+
     local current_top_index = nil
+
+    -- sequential attenuation memory (original behavior)
     local prev_brightness = nil
     local prev_top_index = nil
+
+    -- depth-aware memory for stereo pairing (and “previous at this depth” lookup)
+    local last_at_depth = {}         -- [depth] = { name = "...", brightness = 0.xx }
+    local last_depth_seen = 0
 
     for i = 0, track_count - 1 do
         local track = reaper.GetTrack(proj, i)
         local depth = reaper.GetTrackDepth(track)
+        local _, name = reaper.GetTrackName(track, "")
 
-        -- New top-level anchor
         if depth == 0 then
             current_top_index = i
+            -- New top block: reset depth tracking
+            last_at_depth = {}
+            last_depth_seen = 0
+            prev_brightness = nil
+            prev_top_index = nil
         end
 
-        if current_top_index ~= nil then
-            local h = top_level_hues[current_top_index]
+        local base = current_top_index and top_level_base_rgb[current_top_index] or nil
+        if base ~= nil then
+            -- Clear deeper remembered depths when we move up
+            if depth < last_depth_seen then
+                for d = depth + 1, last_depth_seen do
+                    last_at_depth[d] = nil
+                end
+            end
+            last_depth_seen = depth
 
-            -- If this TL track is in the rainbow set, it has a hue.
-            -- Otherwise (keyword TL) h will be nil and we skip rainbow color.
-            if h ~= nil then
-                local s = PASTEL_SATURATION
-                local v
+            local v
 
-                if depth == 0 then
-                    -- Top-level tracks always start at full brightness
-                    v = 1.0
+            if depth == 0 then
+                v = 1.0
+            else
+                if DARKEN_MODE == "by_depth" then
+                    v = 1.0 - (DARKEN_PER_STEP * depth)
                 else
-                    if DARKEN_MODE == "from_previous" then
-                        -- Darken progressively from the track above (within the same top-level block)
-                        if prev_top_index ~= current_top_index or prev_brightness == nil then
-                            -- First non-top track under this top-level
+                    -- from_previous (sequential), but stereo can override based on previous at SAME depth
+                    local same_block = (prev_top_index == current_top_index)
+                    local prev_same_depth = last_at_depth[depth]
+
+                    if prev_same_depth and is_stereo_pair(prev_same_depth.name, name) then
+                        -- Stereo-pair lock (ignores intervening children)
+                        v = prev_same_depth.brightness
+                    else
+                        -- Normal sequential attenuation
+                        if (not same_block) or (prev_brightness == nil) then
                             v = 1.0 - DARKEN_PER_STEP
                         else
                             v = prev_brightness * (1.0 - DARKEN_PER_STEP)
                         end
-                    else
-                        -- "by_depth": brightness is a function of depth only
-                        v = 1.0 * (1.0 - DARKEN_PER_STEP * depth)
                     end
                 end
-
-                if v < MIN_VALUE then
-                    v = MIN_VALUE
-                end
-
-                local r, g, b = hsv_to_rgb(h, s, v)
-                local native_color = rgb_to_native(r, g, b)
-
-                color_track_and_items(track, native_color)
-
-                -- Remember for next iteration
-                prev_brightness = v
-                prev_top_index = current_top_index
-            else
-                -- For non-rainbow (keyword TL) blocks, do not color here.
-                -- They will be colored in the keyword override pass.
             end
+
+            if v < MIN_VALUE then
+                v = MIN_VALUE
+            end
+
+            local r = math.floor(base.r * v + 0.5)
+            local g = math.floor(base.g * v + 0.5)
+            local b = math.floor(base.b * v + 0.5)
+
+            local native_color = rgb_to_native(r, g, b)
+            color_track_and_items(track, native_color)
+
+            -- Update sequential memory
+            prev_brightness = v
+            prev_top_index = current_top_index
+
+            -- Update same-depth memory (used for stereo pairing even if children appear after)
+            last_at_depth[depth] = { name = name, brightness = v }
+        else
+            -- Keyword TL blocks are not in base map; reset sequential memory to avoid leakage
+            prev_brightness = nil
+            prev_top_index = nil
+            last_at_depth = {}
+            last_depth_seen = 0
         end
     end
 
-    --------------------------------------------------------
-    -- Keyword override pass: apply keyword colors
-    -- (track + its subtracks + their items/takes)
-    -- This now includes:
-    --   - keyword top-level tracks (which never got rainbow),
-    --   - any non-top tracks that match keywords.
-    --------------------------------------------------------
+    -- Pass 2: keyword overrides (track + subtracks + items/takes)
     if #COLOR_RULES > 0 then
         for i = 0, track_count - 1 do
             local track = reaper.GetTrack(proj, i)
@@ -358,10 +620,15 @@ local function main()
         end
     end
 
+    if g_use_gradient then
+        unload_gradient_image()
+    end
+
     reaper.TrackList_AdjustWindows(false)
     reaper.UpdateArrange()
 end
 
+
 reaper.Undo_BeginBlock()
 main()
-reaper.Undo_EndBlock("Rainbow + keyword colors, pastel, darker subtracks, item colors (keywords excluded from rainbow split)", -1)
+reaper.Undo_EndBlock("Track colors: gradient/rainbow + keywords + stereo pair lock (depth-aware)", -1)
